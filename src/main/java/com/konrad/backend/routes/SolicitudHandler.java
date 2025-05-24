@@ -1,33 +1,30 @@
 
 package com.konrad.backend.routes;
 
-import com.konrad.backend.model.Documento;
 import com.konrad.backend.model.EstadoSolicitud;
 import com.konrad.backend.model.Solicitud;
 import com.konrad.backend.model.TipoPersona;
 import com.konrad.backend.service.SolicitudService;
 import com.konrad.backend.service.DocumentoService;
+import com.konrad.backend.service.SolicitudFacadeService;
 
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Paths;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Arrays;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.UUID;
 
+import java.util.Map;
+import java.util.stream.Collectors;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.MediaType;
 import org.springframework.http.codec.multipart.FilePart;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.server.ServerRequest;
 import org.springframework.web.reactive.function.server.ServerResponse;
 
-import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 @Component
@@ -36,6 +33,9 @@ public class SolicitudHandler {
     private final SolicitudService solicitudService;
     private final DocumentoService documentoService;
 
+    @Autowired
+    private SolicitudFacadeService solicitudFacadeService;
+
     public SolicitudHandler(SolicitudService solicitudService,
             DocumentoService documentoService) {
         this.documentoService = documentoService;
@@ -43,7 +43,7 @@ public class SolicitudHandler {
     }
 
     public Mono<ServerResponse> crearSolicitud(ServerRequest request) {
-        // Leer query params
+        // Extrae los query params
         String nombres = request.queryParam("nombres").orElse("");
         String apellidos = request.queryParam("apellidos").orElse("");
         String numeroIdentificacion = request.queryParam("numeroIdentificacion").orElse("");
@@ -53,38 +53,25 @@ public class SolicitudHandler {
         String telefono = request.queryParam("telefono").orElse("");
         String tipoIdentificacion = request.queryParam("tipoIdentificacion").orElse("").toUpperCase();
 
-        // Validar tipoIdentificacion
         TipoPersona tipoPersona;
         if ("CEDULA".equals(tipoIdentificacion)) {
             tipoPersona = TipoPersona.NATURAL;
         } else if ("NIT".equals(tipoIdentificacion)) {
             tipoPersona = TipoPersona.JURIDICA;
         } else {
-            return ServerResponse.badRequest()
-                    .bodyValue("tipoIdentificacion inválido, debe ser CEDULA o NIT");
+            return ServerResponse.badRequest().bodyValue("tipoIdentificacion inválido, debe ser CEDULA o NIT");
         }
 
-        // Leer multipart data (archivos)
+        // Recibe los archivos del multipart
         return request.multipartData()
                 .flatMap(parts -> {
-                    // Archivos requeridos según tipoPersona
-                    List<String> requiredDocs = tipoPersona == TipoPersona.NATURAL
-                            ? List.of("fotocopia_cedula", "formato_aceptacion_consulta",
-                                    "formato_aceptacion_tratamiento")
-                            : List.of("fotocopia_nit", "formato_aceptacion_consulta", "formato_aceptacion_tratamiento",
-                                    "rut", "camara_comercio");
+                    // Convierte MultiValueMap<String, Part> a Map<String, FilePart>
+                    Map<String, FilePart> archivos = parts.entrySet().stream()
+                            .filter(e -> e.getValue().get(0) instanceof FilePart)
+                            .collect(Collectors.toMap(
+                                    Map.Entry::getKey,
+                                    e -> (FilePart) e.getValue().get(0)));
 
-                    // Validar archivos presentes
-                    Set<String> archivosRecibidos = parts.keySet();
-                    List<String> faltantes = requiredDocs.stream()
-                            .filter(doc -> !archivosRecibidos.contains(doc))
-                            .toList();
-                    if (!faltantes.isEmpty()) {
-                        return ServerResponse.badRequest()
-                                .bodyValue("Faltan documentos obligatorios: " + String.join(", ", faltantes));
-                    }
-
-                    // Crear solicitud sin documentos (guardaremos luego)
                     Solicitud solicitud = new Solicitud();
                     solicitud.setNombres(nombres);
                     solicitud.setApellidos(apellidos);
@@ -94,74 +81,26 @@ public class SolicitudHandler {
                     solicitud.setCiudadResidencia(ciudadResidencia);
                     solicitud.setTelefono(telefono);
                     solicitud.setTipoPersona(tipoPersona);
-                    solicitud.setFechaCreacion(LocalDateTime.now());
-                    solicitud.setEstado(EstadoSolicitud.PENDIENTE);
+                    solicitud.setFechaCreacion(java.time.LocalDateTime.now());
+                    solicitud.setEstado(com.konrad.backend.model.EstadoSolicitud.PENDIENTE);
 
-                    // Guardar archivos (reactivo) y crear lista Mono<Documento>
-                    List<Mono<Documento>> documentosMono = requiredDocs.stream()
-                            .<Mono<Documento>>map(docName -> {
-                                FilePart filePart = (FilePart) parts.getFirst(docName);
-
-                                String basePath = System.getProperty("java.io.tmpdir"); // Ruta temporal OS
-                                                                                        // independiente
-                                java.nio.file.Path destinoPath = Paths
-                                        .get(basePath, "uploads", UUID.randomUUID() + "-" + filePart.filename());
-                                String rutaDestino = destinoPath.toString();
-
-                                try {
-                                    if (!Files.exists(destinoPath.getParent())) {
-                                        Files.createDirectories(destinoPath.getParent());
-                                    }
-                                } catch (IOException e) {
-                                    return Mono.error(e);
-                                }
-
-                                Mono<Void> guardado = filePart.transferTo(destinoPath);
-                                // Crear objeto Documento con ruta y tipo, solicitudId lo asignamos después
-                                return guardado.thenReturn(new Documento(null, docName, rutaDestino, null));
-                            })
-                            .toList();
-
-                    // Primero guardamos los archivos y recolectamos documentos
-                    return Flux.concat(documentosMono)
-                            .collectList()
-                            .flatMap(documentosGuardados ->
-                    // Guardamos la solicitud para obtener id
-                    solicitudService.crearSolicitud(solicitud)
-                            .flatMap(solicitudGuardada -> {
-                                // Asignamos solicitudId a cada documento y guardamos
-                                List<Mono<Documento>> docsGuardadosConId = documentosGuardados.stream()
-                                        .map(doc -> {
-                                            doc.setSolicitudId(solicitudGuardada.getId());
-                                            return documentoService.guardarDocumento(doc);
-                                        })
-                                        .toList();
-
-                                // Guardar todos los documentos y devolver la solicitud
-                                return Flux.concat(docsGuardadosConId)
-                                        .then(Mono.just(solicitudGuardada));
-                            }))
+                    return solicitudFacadeService.procesarSolicitud(solicitud, archivos)
                             .flatMap(solicitudGuardada -> ServerResponse.ok()
                                     .contentType(MediaType.APPLICATION_JSON)
-                                    .bodyValue(solicitudGuardada));
-                })
-                .onErrorResume(e -> {
-
-                    if (e instanceof org.springframework.dao.DuplicateKeyException
-                            || (e.getCause() != null
-                                    && e.getCause() instanceof io.r2dbc.spi.R2dbcDataIntegrityViolationException)) {
-                        return ServerResponse.status(409) // Conflict
-                                .contentType(MediaType.APPLICATION_JSON)
-                                .bodyValue(
-                                        Map.of("error", "Número de identificación duplicado",
-                                                "message", "Ya existe una solicitud con ese número de identificación"));
-                    }
-                    // Manejo general para otros errores
-                    return ServerResponse.status(500)
-                            .contentType(MediaType.APPLICATION_JSON)
-                            .bodyValue(
-                                    Map.of("error", "Error interno del servidor",
-                                            "message", e.getMessage()));
+                                    .bodyValue(solicitudGuardada))
+                            .onErrorResume(e -> {
+                                if (e instanceof DuplicateKeyException || (e.getCause() != null && e.getCause()
+                                        .getClass().getSimpleName().contains("R2dbcDataIntegrityViolationException"))) {
+                                    return ServerResponse.status(409)
+                                            .contentType(MediaType.APPLICATION_JSON)
+                                            .bodyValue(Map.of(
+                                                    "error", "Ya existe una solicitud con ese número de identificación",
+                                                    "codigo", "DUPLICATE_NUMERO_IDENTIFICACION"));
+                                }
+                                return ServerResponse.status(400)
+                                        .contentType(MediaType.APPLICATION_JSON)
+                                        .bodyValue(Map.of("error", e.getMessage()));
+                            });
                 });
     }
 
